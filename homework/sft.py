@@ -29,13 +29,24 @@ def tokenize(tokenizer, question: str, answer: str):
 
     tokenizer.padding_side = "right"
     tokenizer.pad_token = tokenizer.eos_token
-    full = tokenizer(full_text, padding="max_length", truncation=True, max_length=128)
+    full = tokenizer(
+        full_text,
+        padding="max_length",
+        truncation=True,
+        max_length=256,
+        add_special_tokens=False,
+    )
 
     input_ids = full["input_ids"]
-    question_len = len(tokenizer(question)["input_ids"])
+
+    question_ids = tokenizer(
+        f"{question} ", add_special_tokens=False)["input_ids"]
+    answer_start = min(len(question_ids), len(input_ids))
 
     # Create labels: mask out the prompt part
-    labels = [-100] * question_len + input_ids[question_len:]
+    labels = [-100] * len(input_ids)
+    for i in range(answer_start, len(input_ids)):
+        labels[i] = input_ids[i]
 
     for i in range(len(labels)):
         if full["attention_mask"][i] == 0:
@@ -49,7 +60,17 @@ def format_example(prompt: str, answer: str) -> dict[str, str]:
     """
     Construct a question / answer pair. Consider rounding the answer to make it easier for the LLM.
     """
-    raise NotImplementedError()
+    # Prepend the same instruction used at inference without instantiating a model/tokenizer
+    instructed_question = (
+        f"{prompt}\n"
+        "Answer with only one number inside <answer>...</answer> and nothing after."
+    )
+    answer_text = f"<answer>{answer}</answer>"
+
+    return {
+        "question": instructed_question,
+        "answer": answer_text,
+    }
 
 
 class TokenizedDataset:
@@ -75,10 +96,67 @@ class TokenizedDataset:
 
 
 def train_model(
-    output_dir: str,
+    output_dir: str | None = None,
     **kwargs,
 ):
-    raise NotImplementedError()
+    from pathlib import Path
+
+    import torch
+    from transformers import Trainer, TrainingArguments, default_data_collator
+    from peft import LoraConfig, get_peft_model
+
+    llm = BaseLLM()
+
+    lora_config = LoraConfig(
+        task_type="CAUSAL_LM",
+        target_modules="all-linear",
+        r=8,
+        lora_alpha=48,
+        lora_dropout=0.1,
+        bias="none",
+    )
+    llm.model = get_peft_model(llm.model, lora_config).to(llm.device)
+
+    if torch.cuda.is_available():
+        llm.model.enable_input_require_grads()
+
+    train_ds = TokenizedDataset(
+        llm.tokenizer,
+        Dataset("train"),
+        format_example,
+    )
+
+    if not output_dir:
+        output_path = Path(__file__).parent / "sft_runs"
+    else:
+        output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    training_args = TrainingArguments(
+        output_dir=str(output_path),
+        logging_dir=str(output_path),
+        report_to=["tensorboard"],
+        learning_rate=1e-4,
+        gradient_checkpointing=True,
+        per_device_train_batch_size=32,
+        num_train_epochs=5,
+    )
+
+    trainer = Trainer(
+        model=llm.model,
+        args=training_args,
+        train_dataset=train_ds,
+        data_collator=default_data_collator,
+    )
+
+    trainer.train()
+
+    final_ckpt = Path(__file__).parent / "sft_model"
+    final_ckpt.mkdir(parents=True, exist_ok=True)
+    llm.model.save_pretrained(final_ckpt)
+    llm.model.save_pretrained(output_path)
+
+    output_dir = str(final_ckpt)
     test_model(output_dir)
 
 

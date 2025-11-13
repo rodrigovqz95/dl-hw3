@@ -5,13 +5,15 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 checkpoint = "HuggingFaceTB/SmolLM2-360M-Instruct"
 
-device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+device = "cuda" if torch.cuda.is_available(
+) else "mps" if torch.backends.mps.is_available() else "cpu"
 
 
 class BaseLLM:
     def __init__(self, checkpoint=checkpoint):
         self.tokenizer = AutoTokenizer.from_pretrained(checkpoint)
-        self.model = AutoModelForCausalLM.from_pretrained(checkpoint).to(device)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            checkpoint).to(device)
         self.device = device
 
     def format_prompt(self, question: str) -> str:
@@ -20,7 +22,8 @@ class BaseLLM:
         better if you provide a chat template. self.tokenizer.apply_chat_template can help here
         You don't need to change this function for now.
         """
-        return question
+        # Encourage models (especially SFT/RFT) to output a single numeric result in tags
+        return f"{question}\nAnswer with only one number inside <answer>...</answer> and nothing after."
 
     def parse_answer(self, answer: str) -> float:
         """
@@ -30,7 +33,10 @@ class BaseLLM:
         try:
             return float(answer.split("<answer>")[1].split("</answer>")[0])
         except (IndexError, ValueError):
-            return float("nan")
+            # Fallback: extract first numeric literal if tags are missing
+            import re
+            m = re.search(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", answer)
+            return float(m.group(0)) if m else float("nan")
 
     def generate(self, prompt: str) -> str:
         """
@@ -102,10 +108,76 @@ class BaseLLM:
                 for idx in tqdm(
                     range(0, len(prompts), micro_batch_size), desc=f"LLM Running on Micro Batches {micro_batch_size}"
                 )
-                for r in self.batched_generate(prompts[idx : idx + micro_batch_size], num_return_sequences, temperature)
+                for r in self.batched_generate(prompts[idx: idx + micro_batch_size], num_return_sequences, temperature)
             ]
+        # Prepare tokenizer for left padding during generation
+        original_padding_side = getattr(
+            self.tokenizer, "padding_side", "right")
+        self.tokenizer.padding_side = "left"
+        # Some models don't have an explicit pad token; use EOS as pad to avoid warnings
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        raise NotImplementedError()
+        # Tokenize batch
+        inputs = self.tokenizer(
+            prompts,
+            padding=True,
+            return_tensors="pt",
+        )
+        # Move to device
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+
+        # Determine generation params
+        do_sample = temperature is not None and float(temperature) > 0
+        gen_kwargs = {
+            "max_new_tokens": 30,
+            "min_new_tokens": 5,
+            "do_sample": do_sample,
+            "temperature": float(temperature) if do_sample else 1.0,
+            "num_return_sequences": 1 if num_return_sequences is None else int(num_return_sequences),
+            "eos_token_id": self.tokenizer.eos_token_id,
+            "pad_token_id": self.tokenizer.pad_token_id,
+        }
+
+        with torch.no_grad():
+            outputs = self.model.generate(
+                input_ids=inputs["input_ids"],
+                attention_mask=inputs.get("attention_mask", None),
+                **gen_kwargs,
+            )
+
+        # Slice off the input portion per example to decode only generated tokens
+        attention_mask = inputs.get("attention_mask", None)
+        if attention_mask is not None:
+            prompt_lengths = attention_mask.sum(dim=1).tolist()
+        else:
+            prompt_lengths = [inputs["input_ids"].shape[1]] * \
+                inputs["input_ids"].shape[0]
+
+        n_ret = 1 if num_return_sequences is None else int(
+            num_return_sequences)
+        decoded: list[str] = []
+        total_rows = outputs.shape[0]
+        for row in range(total_rows):
+            src_idx = row // n_ret  # which original prompt produced this row
+            start = int(prompt_lengths[src_idx])
+            row_tokens = outputs[row, start:]
+            text = self.tokenizer.decode(row_tokens, skip_special_tokens=True)
+            decoded.append(text)
+
+        # Restore tokenizer padding_side
+        self.tokenizer.padding_side = original_padding_side
+
+        n_ret = 1 if num_return_sequences is None else int(
+            num_return_sequences)
+        if n_ret == 1:
+            return decoded
+
+        # Group into per-prompt lists
+        grouped: list[list[str]] = []
+        for i in range(0, len(decoded), n_ret):
+            grouped.append(decoded[i: i + n_ret])
+        return grouped
 
     def answer(self, *questions) -> list[float]:
         """

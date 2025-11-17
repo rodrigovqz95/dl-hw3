@@ -55,7 +55,15 @@ class CoTModel(BaseLLM):
             },
             {
                 "role": "user",
-                "content": question,
+                "content": "Convert 12 in to cm.",
+            },
+            {
+                "role": "assistant",
+                "content": "1 in = 2.54 cm. 12 × 2.54 =\n<answer>30.48</answer>",
+            },
+            {
+                "role": "user",
+                "content": question.strip(),
             },
         ]
 

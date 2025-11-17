@@ -63,7 +63,7 @@ def format_example(prompt: str, answer: str) -> dict[str, str]:
     # Prepend the same instruction used at inference without instantiating a model/tokenizer
     instructed_question = (
         f"{prompt}\n"
-        "Answer with only one number inside <answer>...</answer> and nothing after."
+        ".Answer following this exact format: answer>answer</answer>, where answer is the ground truth `float` answer. Do not write anything more, do not write anything less. Only exactly the float answer inside the format mentioned"
     )
     answer_text = f"<answer>{answer}</answer>"
 
@@ -112,7 +112,7 @@ def train_model(
         target_modules="all-linear",
         r=8,
         lora_alpha=48,
-        lora_dropout=0.1,
+        lora_dropout=0.02,
         bias="none",
     )
     llm.model = get_peft_model(llm.model, lora_config).to(llm.device)
@@ -164,7 +164,6 @@ def test_model(ckpt_path: str):
     testset = Dataset("valid")
     llm = BaseLLM()
 
-    # Load the model with LoRA adapters
     from peft import PeftModel
 
     llm.model = PeftModel.from_pretrained(llm.model, ckpt_path).to(llm.device)

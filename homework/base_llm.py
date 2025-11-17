@@ -18,12 +18,9 @@ class BaseLLM:
 
     def format_prompt(self, question: str) -> str:
         """
-        Take a question and convert it into an input to SmolLM2. The LLM will likely answer much
-        better if you provide a chat template. self.tokenizer.apply_chat_template can help here
-        You don't need to change this function for now.
+        Take a question and convert it into an input to SmolLM2.
         """
-        # Encourage models (especially SFT/RFT) to output a single numeric result in tags
-        return f"{question}\nAnswer with only one number inside <answer>...</answer> and nothing after."
+        return f"{question}\nAnswer with only one float number inside <answer>...</answer> and nothing after."
 
     def parse_answer(self, answer: str) -> float:
         """
@@ -110,24 +107,22 @@ class BaseLLM:
                 )
                 for r in self.batched_generate(prompts[idx: idx + micro_batch_size], num_return_sequences, temperature)
             ]
-        # Prepare tokenizer for left padding during generation
+
         original_padding_side = getattr(
             self.tokenizer, "padding_side", "right")
         self.tokenizer.padding_side = "left"
-        # Some models don't have an explicit pad token; use EOS as pad to avoid warnings
+
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        # Tokenize batch
         inputs = self.tokenizer(
             prompts,
             padding=True,
             return_tensors="pt",
         )
-        # Move to device
+
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
-        # Determine generation params
         do_sample = temperature is not None and float(temperature) > 0
         gen_kwargs = {
             "max_new_tokens": 30,
@@ -146,7 +141,6 @@ class BaseLLM:
                 **gen_kwargs,
             )
 
-        # Slice off the input portion per example to decode only generated tokens
         attention_mask = inputs.get("attention_mask", None)
         if attention_mask is not None:
             prompt_lengths = attention_mask.sum(dim=1).tolist()
@@ -159,13 +153,16 @@ class BaseLLM:
         decoded: list[str] = []
         total_rows = outputs.shape[0]
         for row in range(total_rows):
-            src_idx = row // n_ret  # which original prompt produced this row
+            src_idx = row // n_ret
             start = int(prompt_lengths[src_idx])
             row_tokens = outputs[row, start:]
             text = self.tokenizer.decode(row_tokens, skip_special_tokens=True)
+            end_tag = "</answer>"
+            end_pos = text.find(end_tag)
+            if end_pos != -1:
+                text = text[: end_pos + len(end_tag)]
             decoded.append(text)
 
-        # Restore tokenizer padding_side
         self.tokenizer.padding_side = original_padding_side
 
         n_ret = 1 if num_return_sequences is None else int(
@@ -173,7 +170,6 @@ class BaseLLM:
         if n_ret == 1:
             return decoded
 
-        # Group into per-prompt lists
         grouped: list[list[str]] = []
         for i in range(0, len(decoded), n_ret):
             grouped.append(decoded[i: i + n_ret])
